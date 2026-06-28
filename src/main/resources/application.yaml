@@ -4,40 +4,29 @@ spring:
 
   data:
     mongodb:
-      # Connection string. In Docker this is overridden by the
-      # SPRING_DATA_MONGODB_URI env var (mongodb://mongodb:27017/ocr_db).
-      # An explicit MongoClient bean (MongoConfig) also reads this value, so
-      # the connection is honored even if auto-config misbehaves on Boot 4.x.
       uri: ${SPRING_DATA_MONGODB_URI:mongodb://localhost:27017/ocr_db}
-      # Database name must also be set explicitly because a custom MongoClient
-      # bean doesn't always carry the db name from the URI into Spring Data.
       database: ${MONGO_DB:ocr_db}
       auto-index-creation: true
 
   servlet:
     multipart:
       enabled: true
-      # We store the uploaded file bytes in MongoDB like the professor's sample.
-      # Keep this safely below MongoDB's 16MB document limit.
-      max-file-size: ${OCR_MAX_FILE_SIZE:10MB}
-      max-request-size: ${OCR_MAX_REQUEST_SIZE:12MB}
+      max-file-size: ${OCR_MAX_FILE_SIZE:50MB}
+      max-request-size: ${OCR_MAX_REQUEST_SIZE:55MB}
 
 server:
   port: ${OCR_SERVICE_PORT:8090}
 
 ocr:
-  # Local dev default: a path RELATIVE to the working directory (same trick
-  # that worked in the main platform project) instead of relying on
-  # classloader.getResource("tessdata").getPath(), which returns a
-  # URL-style path (leading "/C:/...") that Tesseract's native library
-  # does not reliably parse on Windows — that mismatch is what caused
-  # "Error opening data file" / "Invalid memory access" here.
-  # In Docker, OCR_TESSDATA_PATH overrides this with the real install path.
   tessdata-path: ${OCR_TESSDATA_PATH:src/main/resources/tessdata}
-  # fas+eng so mixed Persian/English documents are read correctly.
-  # With only "fas", Tesseract mis-reads embedded English words/numbers.
   language: ${OCR_LANGUAGE:fas+eng}
   pdf-dpi: ${OCR_PDF_DPI:250}
+
+minio:
+  endpoint: ${MINIO_ENDPOINT:http://localhost:9000}
+  access-key: ${MINIO_ACCESS_KEY:minioadmin}
+  secret-key: ${MINIO_SECRET_KEY:minioadmin}
+  bucket: ${MINIO_BUCKET:ocr-documents}
 
 springdoc:
   swagger-ui:

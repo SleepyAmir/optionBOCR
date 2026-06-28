@@ -12,9 +12,8 @@ import org.springframework.data.mongodb.core.mapping.Document;
 import java.time.LocalDateTime;
 
 /**
- * Stores only the uploaded file itself and its metadata — no OCR result here.
- * Coordinated with the database team: this collection holds "the file",
- * OcrResult (separate collection) holds "the OCR text for that file".
+ * Document metadata only. The original uploaded file is NOT stored as byte[] in
+ * MongoDB anymore; it is stored in MinIO and Mongo keeps only bucket/objectKey.
  */
 @Getter
 @Setter
@@ -35,12 +34,18 @@ public class OcrFile {
 
     private Integer pageCount;
 
-    /**
-     * Like the professor's sample, we keep the uploaded file bytes in MongoDB.
-     * For large production files, GridFS would be a better option.
-     */
-    private byte[] fileData;
+    private String bucketName;
+
+    @Indexed
+    private String objectKey;
+
+    @Indexed
+    private OcrStatus status;
+
+    private String errorMessage;
 
     @Indexed
     private LocalDateTime createdAt;
+
+    private LocalDateTime updatedAt;
 }

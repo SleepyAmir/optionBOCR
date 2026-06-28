@@ -1,15 +1,3 @@
-# Standalone Compose for the OCR service + its OWN MongoDB.
-#
-# Fully isolated from the platform stack:
-#   - its own network (ocr-net) and its own mongo volume (ocr_mongo_data)
-#   - the platform's MongoDB is never touched
-#
-# Host vs internal ports (this is what was tripping things up):
-#   - "27018:27017"  -> 27018 is what YOU see from Windows (e.g. Compass:
-#                        mongodb://localhost:27018), 27017 is the port INSIDE
-#                        the docker network.
-#   - The ocr-service container talks to mongo as  mongodb:27017
-#     (service name + INTERNAL port) — NOT localhost, NOT 27018.
 services:
   mongodb:
     image: mongo:8.0
@@ -17,7 +5,7 @@ services:
     environment:
       MONGO_INITDB_DATABASE: ocr_db
     ports:
-      - "27018:27017"          # host:container — 27018 avoids clashing with the platform mongo on 27017
+      - "43818:27017"
     volumes:
       - ocr_mongo_data:/data/db
     networks:
@@ -29,30 +17,89 @@ services:
       retries: 5
     restart: unless-stopped
 
+  minio:
+    image: quay.io/minio/minio:latest
+    container_name: ocr-minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    ports:
+      - "43819:9000"
+      - "43820:9001"
+    volumes:
+      - ocr_minio_data:/data
+    networks:
+      - ocr-net
+    restart: unless-stopped
+
+  opensearch:
+    profiles: ["search"]
+    image: opensearchproject/opensearch:3.3.0
+    container_name: ocr-opensearch
+    environment:
+      discovery.type: single-node
+      bootstrap.memory_lock: "true"
+      OPENSEARCH_JAVA_OPTS: "-Xms512m -Xmx512m"
+      DISABLE_SECURITY_PLUGIN: "true"
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+    ports:
+      - "43821:9200"
+      - "43822:9600"
+    volumes:
+      - ocr_opensearch_data:/usr/share/opensearch/data
+    networks:
+      - ocr-net
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fs http://localhost:9200/_cluster/health || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+    restart: unless-stopped
+
+  opensearch-dashboards:
+    profiles: ["search"]
+    image: opensearchproject/opensearch-dashboards:3.3.0
+    container_name: ocr-opensearch-dashboards
+    environment:
+      OPENSEARCH_HOSTS: '["http://opensearch:9200"]'
+      DISABLE_SECURITY_DASHBOARDS_PLUGIN: "true"
+    ports:
+      - "43823:5601"
+    networks:
+      - ocr-net
+    depends_on:
+      opensearch:
+        condition: service_healthy
+    restart: unless-stopped
+
   ocr-service:
     build:
       context: .
       dockerfile: Dockerfile
     container_name: ocr-service
     ports:
-      - "8090:8090"
+      - "43817:8090"
     environment:
-      # Pass the Spring property DIRECTLY as an env var (relaxed binding:
-      # SPRING_DATA_MONGODB_URI -> spring.data.mongodb.uri). This bypasses any
-      # placeholder/YAML resolution issues — Spring reads this env var natively.
       SPRING_DATA_MONGODB_URI: mongodb://mongodb:27017/ocr_db
-
       OCR_SERVICE_PORT: 8090
-      # NOTE: OCR_TESSDATA_PATH and OCR_LANGUAGE are intentionally NOT set here.
-      # The Dockerfile already sets them (OCR_TESSDATA_PATH=/app/tessdata,
-      # OCR_LANGUAGE=fas+eng) using the project's own bundled language files.
-      # Setting a wrong path here previously caused Tesseract to crash (SIGSEGV).
       OCR_PDF_DPI: 250
+      MINIO_ENDPOINT: http://minio:9000
+      MINIO_ACCESS_KEY: minioadmin
+      MINIO_SECRET_KEY: minioadmin
+      MINIO_BUCKET: ocr-documents
+      # OpenSearch is mainly for Python AI/RAG. Exposed here for the full stack.
+      OPENSEARCH_URL: http://opensearch:9200
     networks:
       - ocr-net
     depends_on:
       mongodb:
         condition: service_healthy
+      minio:
+        condition: service_started
     restart: unless-stopped
 
 networks:
@@ -61,3 +108,5 @@ networks:
 
 volumes:
   ocr_mongo_data:
+  ocr_minio_data:
+  ocr_opensearch_data:

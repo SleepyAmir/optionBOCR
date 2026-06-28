@@ -67,6 +67,13 @@
             <version>3.0.3</version>
         </dependency>
 
+        <!-- ===== MinIO: S3-compatible object storage for uploaded files ===== -->
+        <dependency>
+            <groupId>io.minio</groupId>
+            <artifactId>minio</artifactId>
+            <version>8.5.17</version>
+        </dependency>
+
         <dependency>
             <groupId>org.projectlombok</groupId>
             <artifactId>lombok</artifactId>

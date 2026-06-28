@@ -1,5 +1,7 @@
 package com.example.ocrservice.dto;
 
+import com.example.ocrservice.document.OcrStatus;
+
 import java.time.LocalDateTime;
 
 public record OcrDocumentSummaryResponse(
@@ -8,6 +10,11 @@ public record OcrDocumentSummaryResponse(
         String contentType,
         Long fileSize,
         Integer pageCount,
-        LocalDateTime createdAt
+        String bucketName,
+        String objectKey,
+        OcrStatus status,
+        String errorMessage,
+        LocalDateTime createdAt,
+        LocalDateTime updatedAt
 ) {
 }

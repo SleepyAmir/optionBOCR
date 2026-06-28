@@ -4,7 +4,26 @@ WORKDIR /workspace
 COPY pom.xml ./
 COPY src/ src/
 
-RUN --mount=type=cache,target=/root/.m2 mvn package -DskipTests -B --no-transfer-progress
+# Maven downloads may be unstable on some networks. Retry the dependency
+# download/build and remove partially downloaded artifacts between attempts.
+RUN --mount=type=cache,target=/root/.m2 \
+    set -eux; \
+    for attempt in 1 2 3 4 5; do \
+        echo "Maven build attempt $attempt/5"; \
+        if mvn package -DskipTests -B --no-transfer-progress \
+            -Dmaven.wagon.http.retryHandler.count=5 \
+            -Dmaven.wagon.httpconnectionManager.ttlSeconds=120 \
+            -Dmaven.wagon.rto=120000; then \
+            exit 0; \
+        fi; \
+        echo "Maven build failed; cleaning possibly corrupted partial downloads before retry..."; \
+        rm -rf /root/.m2/repository/com/google/guava/guava/33.3.1-jre \
+               /root/.m2/repository/org/jetbrains/kotlin/kotlin-stdlib/2.3.21 \
+               /root/.m2/repository/org/bouncycastle/bcprov-jdk18on/1.78.1; \
+        sleep 10; \
+    done; \
+    echo "Maven build failed after all retries"; \
+    exit 1
 
 FROM eclipse-temurin:21-jre-jammy
 

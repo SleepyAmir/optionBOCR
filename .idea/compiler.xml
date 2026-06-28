@@ -14,10 +14,14 @@
         <module name="ocr-service" />
       </profile>
     </annotationProcessing>
+    <bytecodeTargetLevel>
+      <module name="optionB" target="1.8" />
+    </bytecodeTargetLevel>
   </component>
   <component name="JavacSettings">
     <option name="ADDITIONAL_OPTIONS_OVERRIDE">
       <module name="ocr-service" options="-parameters" />
+      <module name="optionB" options="-parameters" />
     </option>
   </component>
 </project>
