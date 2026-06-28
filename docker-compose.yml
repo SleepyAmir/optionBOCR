@@ -1,0 +1,63 @@
+# Standalone Compose for the OCR service + its OWN MongoDB.
+#
+# Fully isolated from the platform stack:
+#   - its own network (ocr-net) and its own mongo volume (ocr_mongo_data)
+#   - the platform's MongoDB is never touched
+#
+# Host vs internal ports (this is what was tripping things up):
+#   - "27018:27017"  -> 27018 is what YOU see from Windows (e.g. Compass:
+#                        mongodb://localhost:27018), 27017 is the port INSIDE
+#                        the docker network.
+#   - The ocr-service container talks to mongo as  mongodb:27017
+#     (service name + INTERNAL port) — NOT localhost, NOT 27018.
+services:
+  mongodb:
+    image: mongo:8.0
+    container_name: ocr-mongodb
+    environment:
+      MONGO_INITDB_DATABASE: ocr_db
+    ports:
+      - "27018:27017"          # host:container — 27018 avoids clashing with the platform mongo on 27017
+    volumes:
+      - ocr_mongo_data:/data/db
+    networks:
+      - ocr-net
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  ocr-service:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: ocr-service
+    ports:
+      - "8090:8090"
+    environment:
+      # Pass the Spring property DIRECTLY as an env var (relaxed binding:
+      # SPRING_DATA_MONGODB_URI -> spring.data.mongodb.uri). This bypasses any
+      # placeholder/YAML resolution issues — Spring reads this env var natively.
+      SPRING_DATA_MONGODB_URI: mongodb://mongodb:27017/ocr_db
+
+      OCR_SERVICE_PORT: 8090
+      # NOTE: OCR_TESSDATA_PATH and OCR_LANGUAGE are intentionally NOT set here.
+      # The Dockerfile already sets them (OCR_TESSDATA_PATH=/app/tessdata,
+      # OCR_LANGUAGE=fas+eng) using the project's own bundled language files.
+      # Setting a wrong path here previously caused Tesseract to crash (SIGSEGV).
+      OCR_PDF_DPI: 250
+    networks:
+      - ocr-net
+    depends_on:
+      mongodb:
+        condition: service_healthy
+    restart: unless-stopped
+
+networks:
+  ocr-net:
+    driver: bridge
+
+volumes:
+  ocr_mongo_data:
