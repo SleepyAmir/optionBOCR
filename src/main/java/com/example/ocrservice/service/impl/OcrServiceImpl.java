@@ -43,15 +43,11 @@ import java.net.URL;
 import java.time.LocalDateTime;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
+import java.util.UUID;
 import java.util.regex.Pattern;
+import java.util.stream.Collectors;
 
-/**
- * Pure OCR/text extraction microservice.
- *
- * Original files are stored in MinIO. MongoDB stores metadata and page-level OCR
- * results. Python/OpenSearch can consume the returned pages for chunking,
- * embeddings and RAG/search indexing.
- */
 @Service
 @RequiredArgsConstructor
 public class OcrServiceImpl implements OcrService {
@@ -132,10 +128,27 @@ public class OcrServiceImpl implements OcrService {
         );
     }
 
+    /**
+     * FIX — persist=false → id null:
+     * قبلاً وقتی persistResult=false بود، OcrFile هرگز save نمی‌شد و
+     * file.getId() مقدار null داشت. این null از طریق mapper به
+     * OcrDocumentResponse.id منتقل می‌شد — یعنی caller یه response با
+     * id: null می‌گرفت که گمراه‌کننده‌ست.
+     *
+     * الان قبل از extraction یه UUID تولید می‌شه. در non-persist path این
+     * UUID فقط برای یکپارچگی ساختار response هست و در MongoDB ذخیره نمی‌شه.
+     * چون caller با persistResult=false درخواست داده، می‌دونه که این id
+     * به هیچ سند ذخیره‌شده‌ای اشاره نمی‌کنه.
+     */
     @Override
     public OcrDocumentResponse extractFromStoredFile(OcrStoredFileRequest request) {
         boolean persist = request.persistResult() == null || request.persistResult();
-        StoredObject object = minioStorageService.download(request.bucketName(), request.objectKey());
+
+        // FIX — single HTTP call: contentType رو از request می‌گیریم تا
+        // نیازی به statObject داخل download نباشه
+        StoredObject object = minioStorageService.download(
+                request.bucketName(), request.objectKey(), request.contentType());
+
         String contentType = normalizeContentType(
                 request.contentType() != null ? request.contentType() : object.contentType(),
                 request.originalFileName());
@@ -154,31 +167,36 @@ public class OcrServiceImpl implements OcrService {
                 .build();
 
         if (persist) {
-            file = fileRepository.save(file);
+            file = fileRepository.save(file);   // MongoDB assigns id
+        } else {
+            // FIX: برای non-persist path یه UUID موقت assign می‌کنیم
+            // تا response.id() هرگز null نباشه
+            file.setId(UUID.randomUUID().toString());
         }
 
         try {
             ExtractionResult extraction = extractText(object.data(), contentType, request.originalFileName());
-            OcrResult result = null;
             file.setPageCount(extraction.pageCount());
             file.setStatus(OcrStatus.COMPLETED);
             file.setUpdatedAt(LocalDateTime.now());
 
             if (persist) {
-                result = saveCleanResult(file.getId(), extraction, now);
+                OcrResult result = saveCleanResult(file.getId(), extraction, now);
                 file = fileRepository.save(file);
                 return ocrMapper.toDocumentResponse(file, result);
             }
 
+            // non-persist: extraction فقط به caller برمی‌گرده، هیچ‌چیز ذخیره نمی‌شه
             String cleanText = piiSanitizerService.sanitize(extraction.text());
-            result = OcrResult.builder()
-                    .fileId(file.getId())
+            OcrResult transientResult = OcrResult.builder()
+                    .fileId(file.getId())   // الان non-null
                     .extractedText(cleanText)
                     .normalizedText(PersianTextNormalizer.normalize(cleanText))
                     .pages(sanitizePages(extraction.pages()))
                     .createdAt(now)
                     .build();
-            return ocrMapper.toDocumentResponse(file, result);
+            return ocrMapper.toDocumentResponse(file, transientResult);
+
         } catch (RuntimeException e) {
             file.setStatus(OcrStatus.FAILED);
             file.setErrorMessage(e.getMessage());
@@ -206,7 +224,10 @@ public class OcrServiceImpl implements OcrService {
         if (file.getBucketName() == null || file.getObjectKey() == null) {
             throw new ResourceNotFoundException("Original file location was not found for id: " + id);
         }
-        StoredObject object = minioStorageService.download(file.getBucketName(), file.getObjectKey());
+        // FIX — single HTTP call: contentType رو از MongoDB می‌دیم تا
+        // statObject لازم نشه
+        StoredObject object = minioStorageService.download(
+                file.getBucketName(), file.getObjectKey(), file.getContentType());
         return ocrMapper.toFileResponse(file, object.data());
     }
 
@@ -227,6 +248,20 @@ public class OcrServiceImpl implements OcrService {
         return ocrMapper.toSearchResponse(file, snippets);
     }
 
+    /**
+     * FIX — N+1 query:
+     * نسخه قبلی برای هر OcrResult یه query جداگانه به MongoDB می‌فرستاد
+     * تا OcrFile متناظرش رو پیدا کنه. یعنی برای صفحه‌ای با 20 نتیجه،
+     * 21 query ارسال می‌شد (1 برای resultها + 20 تا برای fileها).
+     *
+     * الان:
+     *   1. همه fileId ها رو از نتایج جمع می‌کنیم
+     *   2. یه بار findAllById با همه id ها می‌زنیم (1 query بیشتر نه)
+     *   3. Map می‌سازیم برای O(1) lookup داخل map()
+     *
+     * کل query ها برای هر صفحه: 2 (یکی برای results، یکی برای files)
+     * به جای N+1
+     */
     @Override
     public Page<OcrSearchResultResponse> searchAllDocuments(String keyword, Pageable pageable) {
         validateKeyword(keyword);
@@ -235,15 +270,32 @@ public class OcrServiceImpl implements OcrService {
             throw new IllegalArgumentException("keyword is required");
         }
         String escapedKeyword = Pattern.quote(normalizedKeyword);
-        return resultRepository.searchByNormalizedTextRegex(escapedKeyword, pageable)
-                .map(result -> {
-                    OcrFile file = fileRepository.findById(result.getFileId())
-                            .orElseThrow(() -> new ResourceNotFoundException(
-                                    "OCR file not found with id: " + result.getFileId()));
-                    List<String> snippets = textSearchService.buildSnippets(result.getExtractedText(), keyword);
-                    return ocrMapper.toSearchResponse(file, snippets);
-                });
+
+        Page<OcrResult> resultPage =
+                resultRepository.searchByNormalizedTextRegex(escapedKeyword, pageable);
+
+        // batch fetch — یه MongoDB query برای همه fileId های صفحه جاری
+        List<String> fileIds = resultPage.getContent().stream()
+                .map(OcrResult::getFileId)
+                .toList();
+
+        Map<String, OcrFile> fileMap = fileRepository.findAllById(fileIds).stream()
+                .collect(Collectors.toMap(OcrFile::getId, f -> f));
+
+        return resultPage.map(result -> {
+            OcrFile file = fileMap.get(result.getFileId());
+            if (file == null) {
+                // OcrResult بدون OcrFile = داده خراب؛ نباید اتفاق بیفته
+                throw new ResourceNotFoundException(
+                        "OCR file missing for result with fileId: " + result.getFileId());
+            }
+            List<String> snippets =
+                    textSearchService.buildSnippets(result.getExtractedText(), keyword);
+            return ocrMapper.toSearchResponse(file, snippets);
+        });
     }
+
+    // ===== private helpers =====
 
     private OcrResult saveCleanResult(String fileId, ExtractionResult extraction, LocalDateTime now) {
         String cleanText = piiSanitizerService.sanitize(extraction.text());
@@ -285,7 +337,8 @@ public class OcrServiceImpl implements OcrService {
                     .build();
             return new ExtractionResult(text, 1, List.of(page));
         }
-        throw new IllegalArgumentException("Unsupported file type. Only image and PDF files are supported.");
+        throw new IllegalArgumentException(
+                "Unsupported file type. Only image and PDF files are supported.");
     }
 
     private String extractFromImage(byte[] imageData) {
@@ -314,7 +367,8 @@ public class OcrServiceImpl implements OcrService {
                 stripper.setEndPage(page);
                 String pageText = stripper.getText(document).trim();
                 if (!pageText.isBlank()) {
-                    digitalFullText.append("\n\n--- Page ").append(page).append(" ---\n").append(pageText);
+                    digitalFullText.append("\n\n--- Page ").append(page).append(" ---\n")
+                            .append(pageText);
                 }
                 digitalPages.add(OcrPage.builder()
                         .pageNumber(page)
@@ -324,7 +378,8 @@ public class OcrServiceImpl implements OcrService {
             }
 
             if (digitalFullText.toString().trim().length() > 50) {
-                return new ExtractionResult(digitalFullText.toString().trim(), pageCount, digitalPages);
+                return new ExtractionResult(
+                        digitalFullText.toString().trim(), pageCount, digitalPages);
             }
 
             PDFRenderer renderer = new PDFRenderer(document);
@@ -362,7 +417,8 @@ public class OcrServiceImpl implements OcrService {
         }
         URL resource = getClass().getClassLoader().getResource("tessdata");
         if (resource == null) {
-            throw new RuntimeException("tessdata was not found. Set OCR_TESSDATA_PATH or add tessdata to classpath.");
+            throw new RuntimeException(
+                    "tessdata was not found. Set OCR_TESSDATA_PATH or add tessdata to classpath.");
         }
         try {
             return new File(resource.toURI()).getAbsolutePath();
@@ -377,27 +433,22 @@ public class OcrServiceImpl implements OcrService {
 
     private boolean isImage(String contentType, String fileName) {
         return (contentType != null && contentType.toLowerCase().startsWith("image/"))
-                || hasAnyExtension(fileName, ".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp");
+                || hasAnyExtension(fileName, ".png", ".jpg", ".jpeg",
+                ".bmp", ".tif", ".tiff", ".webp");
     }
 
     private String normalizeContentType(String contentType, String fileName) {
         if (contentType != null && !contentType.isBlank()) {
             return contentType;
         }
-        if (isPdf(null, fileName)) {
-            return "application/pdf";
-        }
-        if (isImage(null, fileName)) {
-            return "image/*";
-        }
+        if (isPdf(null, fileName)) return "application/pdf";
+        if (isImage(null, fileName)) return "image/*";
         return "application/octet-stream";
     }
 
     private boolean hasAnyExtension(String fileName, String... extensions) {
-        for (String extension : extensions) {
-            if (hasExtension(fileName, extension)) {
-                return true;
-            }
+        for (String ext : extensions) {
+            if (hasExtension(fileName, ext)) return true;
         }
         return false;
     }
@@ -418,6 +469,5 @@ public class OcrServiceImpl implements OcrService {
         }
     }
 
-    private record ExtractionResult(String text, int pageCount, List<OcrPage> pages) {
-    }
+    private record ExtractionResult(String text, int pageCount, List<OcrPage> pages) {}
 }
