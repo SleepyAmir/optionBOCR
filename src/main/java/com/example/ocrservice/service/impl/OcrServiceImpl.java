@@ -48,26 +48,82 @@ import java.util.UUID;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 
+/*==============================*
+ *        OcrServiceImpl        *
+ *==============================*/
+/**
+ * Core business implementation of the OCR service.
+ *
+ * This is the main orchestration class of the project.
+ * A first-time reader should think of this class as the place where:
+ * - OCR workflow is coordinated
+ * - persistence decisions are made
+ * - PDF/image extraction strategies are selected
+ * - MinIO + MongoDB + OCR engine are connected together
+ *
+ * Important note:
+ * This class is intentionally more orchestration-heavy than a tiny CRUD
+ * service, because OCR requires several infrastructure steps around the core
+ * extraction itself.
+ */
 @Service
 @RequiredArgsConstructor
 public class OcrServiceImpl implements OcrService {
 
+    /*==============================*
+     *      Injected dependencies   *
+     *==============================*/
+    /** Repository for file metadata documents. */
     private final OcrFileRepository fileRepository;
+
+    /** Repository for extracted OCR results. */
     private final OcrResultRepository resultRepository;
+
+    /** Maps persistence/domain models to API responses. */
     private final OcrMapper ocrMapper;
+
+    /** Owns keyword/snippet building behavior for OCR search. */
     private final TextSearchService textSearchService;
+
+    /** Scrubs basic PII before text is persisted or returned. */
     private final PiiSanitizerService piiSanitizerService;
+
+    /** Handles original binary file storage in MinIO. */
     private final MinioStorageService minioStorageService;
 
+    /*==============================*
+     *   OCR-related configuration  *
+     *==============================*/
+    /** Path to tessdata files required by Tesseract. */
     @Value("${ocr.tessdata-path:}")
     private String tessdataPath;
 
+    /** OCR language set used by Tesseract, defaulting to Persian + English. */
     @Value("${ocr.language:fas+eng}")
     private String language;
 
+    /** Rendering DPI used when scanned PDFs are converted to images. */
     @Value("${ocr.pdf-dpi:250}")
     private int pdfDpi;
 
+    /*==============================*
+     *   Public API: persist flow   *
+     *==============================*/
+    /**
+     * Full OCR flow with persistence.
+     *
+     * Step-by-step behavior:
+     * 1. validate uploaded file presence
+     * 2. create Mongo metadata with PROCESSING status
+     * 3. upload original file to MinIO
+     * 4. extract text/pages
+     * 5. sanitize + save OCR result in Mongo
+     * 6. mark file as COMPLETED and return final response
+     *
+     * Failure behavior:
+     * - file status is changed to FAILED
+     * - error message is persisted for inspection
+     */
     @Override
     public OcrDocumentResponse extractAndSave(MultipartFile file) throws IOException {
         validateFile(file);
@@ -108,6 +164,16 @@ public class OcrServiceImpl implements OcrService {
         }
     }
 
+    /*==============================*
+     *  Public API: stateless flow  *
+     *==============================*/
+    /**
+     * OCR-only flow without persistence.
+     *
+     * Why this method exists:
+     * - lets an upstream orchestrator reuse OCR without delegating storage
+     * - ideal for service-to-service integration with a main platform
+     */
     @Override
     public OcrExtractionResponse extractOnly(MultipartFile file) throws IOException {
         validateFile(file);
@@ -128,24 +194,23 @@ public class OcrServiceImpl implements OcrService {
         );
     }
 
+    /*==============================*
+     *  Public API: stored-object   *
+     *==============================*/
     /**
-     * FIX — persist=false → id null:
-     * قبلاً وقتی persistResult=false بود، OcrFile هرگز save نمی‌شد و
-     * file.getId() مقدار null داشت. این null از طریق mapper به
-     * OcrDocumentResponse.id منتقل می‌شد — یعنی caller یه response با
-     * id: null می‌گرفت که گمراه‌کننده‌ست.
+     * OCR flow for a file that already exists in MinIO.
      *
-     * الان قبل از extraction یه UUID تولید می‌شه. در non-persist path این
-     * UUID فقط برای یکپارچگی ساختار response هست و در MongoDB ذخیره نمی‌شه.
-     * چون caller با persistResult=false درخواست داده، می‌دونه که این id
-     * به هیچ سند ذخیره‌شده‌ای اشاره نمی‌کنه.
+     * This method exists for distributed architectures where another service
+     * already performed the upload and now sends only a storage reference.
+     *
+     * Important behavior:
+     * - `persistResult=true`  => save metadata/result in Mongo
+     * - `persistResult=false` => return transient response only
      */
     @Override
     public OcrDocumentResponse extractFromStoredFile(OcrStoredFileRequest request) {
         boolean persist = request.persistResult() == null || request.persistResult();
 
-        // FIX — single HTTP call: contentType رو از request می‌گیریم تا
-        // نیازی به statObject داخل download نباشه
         StoredObject object = minioStorageService.download(
                 request.bucketName(), request.objectKey(), request.contentType());
 
@@ -167,10 +232,10 @@ public class OcrServiceImpl implements OcrService {
                 .build();
 
         if (persist) {
-            file = fileRepository.save(file);   // MongoDB assigns id
+            file = fileRepository.save(file);
         } else {
-            // FIX: برای non-persist path یه UUID موقت assign می‌کنیم
-            // تا response.id() هرگز null نباشه
+            // A transient UUID keeps response structure stable even when no
+            // Mongo document is created.
             file.setId(UUID.randomUUID().toString());
         }
 
@@ -186,10 +251,9 @@ public class OcrServiceImpl implements OcrService {
                 return ocrMapper.toDocumentResponse(file, result);
             }
 
-            // non-persist: extraction فقط به caller برمی‌گرده، هیچ‌چیز ذخیره نمی‌شه
             String cleanText = piiSanitizerService.sanitize(extraction.text());
             OcrResult transientResult = OcrResult.builder()
-                    .fileId(file.getId())   // الان non-null
+                    .fileId(file.getId())
                     .extractedText(cleanText)
                     .normalizedText(PersianTextNormalizer.normalize(cleanText))
                     .pages(sanitizePages(extraction.pages()))
@@ -208,6 +272,10 @@ public class OcrServiceImpl implements OcrService {
         }
     }
 
+    /*==============================*
+     *  Public API: read/download   *
+     *==============================*/
+    /** Returns one OCR document by id. */
     @Override
     public OcrDocumentResponse getDocument(String id) {
         OcrFile file = fileRepository.findById(id)
@@ -217,6 +285,9 @@ public class OcrServiceImpl implements OcrService {
                 .orElseGet(() -> ocrMapper.toDocumentResponseWithoutResult(file));
     }
 
+    /**
+     * Downloads the original file from MinIO using metadata stored in MongoDB.
+     */
     @Override
     public OcrFileResponse getOriginalFile(String id) {
         OcrFile file = fileRepository.findById(id)
@@ -224,19 +295,25 @@ public class OcrServiceImpl implements OcrService {
         if (file.getBucketName() == null || file.getObjectKey() == null) {
             throw new ResourceNotFoundException("Original file location was not found for id: " + id);
         }
-        // FIX — single HTTP call: contentType رو از MongoDB می‌دیم تا
-        // statObject لازم نشه
         StoredObject object = minioStorageService.download(
                 file.getBucketName(), file.getObjectKey(), file.getContentType());
         return ocrMapper.toFileResponse(file, object.data());
     }
 
+    /** Returns recent persisted OCR files in descending creation order. */
     @Override
     public Page<OcrDocumentSummaryResponse> getRecentDocuments(Pageable pageable) {
         return fileRepository.findAllByOrderByCreatedAtDesc(pageable)
                 .map(ocrMapper::toSummaryResponse);
     }
 
+    /*==============================*
+     *   Public API: search logic   *
+     *==============================*/
+    /**
+     * Searches for a keyword inside one persisted document and returns UI
+     * snippets rather than full ranking/search metadata.
+     */
     @Override
     public OcrSearchResultResponse searchInsideDocument(String id, String keyword) {
         validateKeyword(keyword);
@@ -249,18 +326,11 @@ public class OcrServiceImpl implements OcrService {
     }
 
     /**
-     * FIX — N+1 query:
-     * نسخه قبلی برای هر OcrResult یه query جداگانه به MongoDB می‌فرستاد
-     * تا OcrFile متناظرش رو پیدا کنه. یعنی برای صفحه‌ای با 20 نتیجه،
-     * 21 query ارسال می‌شد (1 برای resultها + 20 تا برای fileها).
+     * Searches across all persisted OCR results.
      *
-     * الان:
-     *   1. همه fileId ها رو از نتایج جمع می‌کنیم
-     *   2. یه بار findAllById با همه id ها می‌زنیم (1 query بیشتر نه)
-     *   3. Map می‌سازیم برای O(1) lookup داخل map()
-     *
-     * کل query ها برای هر صفحه: 2 (یکی برای results، یکی برای files)
-     * به جای N+1
+     * Implementation detail:
+     * - query is executed against normalized Mongo text
+     * - matching files are then batch-fetched to avoid N+1 queries
      */
     @Override
     public Page<OcrSearchResultResponse> searchAllDocuments(String keyword, Pageable pageable) {
@@ -274,7 +344,6 @@ public class OcrServiceImpl implements OcrService {
         Page<OcrResult> resultPage =
                 resultRepository.searchByNormalizedTextRegex(escapedKeyword, pageable);
 
-        // batch fetch — یه MongoDB query برای همه fileId های صفحه جاری
         List<String> fileIds = resultPage.getContent().stream()
                 .map(OcrResult::getFileId)
                 .toList();
@@ -285,7 +354,6 @@ public class OcrServiceImpl implements OcrService {
         return resultPage.map(result -> {
             OcrFile file = fileMap.get(result.getFileId());
             if (file == null) {
-                // OcrResult بدون OcrFile = داده خراب؛ نباید اتفاق بیفته
                 throw new ResourceNotFoundException(
                         "OCR file missing for result with fileId: " + result.getFileId());
             }
@@ -295,8 +363,12 @@ public class OcrServiceImpl implements OcrService {
         });
     }
 
-    // ===== private helpers =====
-
+    /*==============================*
+     *   Persistence helper logic   *
+     *==============================*/
+    /**
+     * Persists a sanitized OCR result and its normalized searchable copy.
+     */
     private OcrResult saveCleanResult(String fileId, ExtractionResult extraction, LocalDateTime now) {
         String cleanText = piiSanitizerService.sanitize(extraction.text());
         return resultRepository.save(OcrResult.builder()
@@ -308,6 +380,10 @@ public class OcrServiceImpl implements OcrService {
                 .build());
     }
 
+    /**
+     * Sanitizes each page individually so page-level output remains safe and
+     * consistent with the persisted full extracted text.
+     */
     private List<OcrPage> sanitizePages(List<OcrPage> pages) {
         if (pages == null) {
             return List.of();
@@ -324,6 +400,16 @@ public class OcrServiceImpl implements OcrService {
         return clean;
     }
 
+    /*==============================*
+     *    Extraction strategy hub   *
+     *==============================*/
+    /**
+     * Chooses the extraction strategy based on file type.
+     *
+     * Current supported categories:
+     * - PDF
+     * - image formats
+     */
     private ExtractionResult extractText(byte[] bytes, String contentType, String fileName) {
         if (isPdf(contentType, fileName)) {
             return extractFromPdf(bytes);
@@ -341,6 +427,12 @@ public class OcrServiceImpl implements OcrService {
                 "Unsupported file type. Only image and PDF files are supported.");
     }
 
+    /*==============================*
+     *      Image OCR strategy      *
+     *==============================*/
+    /**
+     * Runs OCR directly on an image.
+     */
     private String extractFromImage(byte[] imageData) {
         try {
             BufferedImage image = ImageIO.read(new ByteArrayInputStream(imageData));
@@ -355,6 +447,19 @@ public class OcrServiceImpl implements OcrService {
         }
     }
 
+    /*==============================*
+     *       PDF OCR strategy       *
+     *==============================*/
+    /**
+     * Extracts text from PDF using a two-stage strategy:
+     *
+     * 1. Try fast digital text extraction first
+     * 2. If the PDF appears scanned/non-digital, render pages as images and OCR
+     *    them with Tesseract
+     *
+     * This strategy exists because many PDFs already contain machine-readable
+     * text, and OCR would be slower and noisier in those cases.
+     */
     private ExtractionResult extractFromPdf(byte[] pdfData) {
         try (PDDocument document = Loader.loadPDF(pdfData)) {
             int pageCount = document.getNumberOfPages();
@@ -404,6 +509,15 @@ public class OcrServiceImpl implements OcrService {
         }
     }
 
+    /*==============================*
+     *     Tesseract preparation    *
+     *==============================*/
+    /**
+     * Builds a fresh Tesseract instance with configured datapath/language.
+     *
+     * A fresh instance keeps OCR setup localized and avoids leaking state
+     * between requests.
+     */
     private Tesseract newTesseract() {
         Tesseract tesseract = new Tesseract();
         tesseract.setDatapath(resolveTessdataPath());
@@ -411,6 +525,13 @@ public class OcrServiceImpl implements OcrService {
         return tesseract;
     }
 
+    /**
+     * Resolves the Tesseract training-data path.
+     *
+     * Resolution strategy:
+     * - prefer explicitly configured path
+     * - otherwise fall back to classpath `tessdata`
+     */
     private String resolveTessdataPath() {
         if (tessdataPath != null && !tessdataPath.isBlank()) {
             return new File(tessdataPath).getAbsolutePath();
@@ -427,16 +548,25 @@ public class OcrServiceImpl implements OcrService {
         }
     }
 
+    /*==============================*
+     *  File-type detection helpers *
+     *==============================*/
+    /** Returns true if the file appears to be a PDF. */
     private boolean isPdf(String contentType, String fileName) {
         return "application/pdf".equalsIgnoreCase(contentType) || hasExtension(fileName, ".pdf");
     }
 
+    /** Returns true if the file appears to be a supported image. */
     private boolean isImage(String contentType, String fileName) {
         return (contentType != null && contentType.toLowerCase().startsWith("image/"))
                 || hasAnyExtension(fileName, ".png", ".jpg", ".jpeg",
                 ".bmp", ".tif", ".tiff", ".webp");
     }
 
+    /**
+     * Produces a normalized content type when the client-provided one is absent
+     * or unreliable.
+     */
     private String normalizeContentType(String contentType, String fileName) {
         if (contentType != null && !contentType.isBlank()) {
             return contentType;
@@ -457,17 +587,29 @@ public class OcrServiceImpl implements OcrService {
         return fileName != null && fileName.toLowerCase().endsWith(extension);
     }
 
+    /*==============================*
+     *     Input validation        *
+     *==============================*/
+    /** Basic null/empty upload validation. */
     private void validateFile(MultipartFile file) {
         if (file == null || file.isEmpty()) {
             throw new IllegalArgumentException("No file was uploaded");
         }
     }
 
+    /** Basic keyword validation used by search endpoints. */
     private void validateKeyword(String keyword) {
         if (keyword == null || keyword.isBlank()) {
             throw new IllegalArgumentException("keyword is required");
         }
     }
 
+    /*==============================*
+     *    Internal helper record    *
+     *==============================*/
+    /**
+     * Small internal transport object used to move extraction output between
+     * private methods without leaking implementation details into the public API.
+     */
     private record ExtractionResult(String text, int pageCount, List<OcrPage> pages) {}
 }

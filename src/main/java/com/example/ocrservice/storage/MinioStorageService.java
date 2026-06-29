@@ -15,34 +15,79 @@ import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 
+/*==============================*
+ *      MinioStorageService     *
+ *==============================*/
+/**
+ * Encapsulates all interaction with MinIO object storage.
+ *
+ * Why this class exists:
+ * - keeps storage-specific code out of OCR business logic
+ * - gives the rest of the project a simple upload/download API
+ * - centralizes bucket handling and object-key generation
+ *
+ * Architectural idea:
+ * - original binary files live in MinIO
+ * - MongoDB stores metadata and OCR results only
+ */
 @Service
 @RequiredArgsConstructor
 public class MinioStorageService {
 
+    /*==============================*
+     *      Injected dependencies   *
+     *==============================*/
+    /** Low-level MinIO SDK client created by {@code MinioConfig}. */
     private final MinioClient minioClient;
 
+    /*==============================*
+     *       Runtime optimizations  *
+     *==============================*/
     /**
-     * FIX — ensureBucket cache:
-     * قبلاً هر بار که upload صدا می‌شد، یه HTTP call به MinIO می‌رفت تا
-     * بررسی کنه bucket وجود داره یا نه. الان اسم bucketهایی که یه بار
-     * verify شدن داخل این Set کش می‌شن و تا restart سرویس دیگه HTTP call
-     * نمی‌ره. ConcurrentHashMap.newKeySet() thread-safe هست.
+     * Keeps track of buckets already verified during the current JVM lifetime.
+     *
+     * Why this exists:
+     * - avoids repeated bucket existence checks on every upload
+     * - reduces unnecessary network calls to MinIO
+     * - safe for concurrent access
      */
     private final Set<String> verifiedBuckets = ConcurrentHashMap.newKeySet();
 
+    /*==============================*
+     *   Externalized properties    *
+     *==============================*/
+    /** Default bucket used when callers do not explicitly choose one. */
     @Value("${minio.bucket:ocr-documents}")
     private String defaultBucket;
 
+    /** Exposes the configured default bucket to other layers. */
     public String defaultBucket() {
         return defaultBucket;
     }
 
+    /*==============================*
+     *       Upload operations      *
+     *==============================*/
+    /**
+     * Uploads data to the default bucket and returns the generated object key.
+     *
+     * Typical usage:
+     * - OCR service receives an uploaded file
+     * - this method stores the raw binary in MinIO
+     * - the returned key is stored in Mongo metadata
+     */
     public String upload(byte[] data, String originalFileName, String contentType) {
         String objectKey = buildObjectKey(originalFileName);
         upload(defaultBucket, objectKey, data, contentType);
         return objectKey;
     }
 
+    /**
+     * Uploads bytes to a specific bucket/object key.
+     *
+     * This lower-level overload is useful when a caller already knows exactly
+     * where the object should live.
+     */
     public void upload(String bucketName, String objectKey, byte[] data, String contentType) {
         try {
             ensureBucket(bucketName);
@@ -59,30 +104,30 @@ public class MinioStorageService {
         }
     }
 
+    /*==============================*
+     *      Download operations     *
+     *==============================*/
     /**
-     * Overload بدون contentType — برای جاهایی که contentType از قبل در
-     * دسترس نیست. در صورت امکان از overload زیر استفاده کن تا نیاز به
-     * statObject نباشه.
+     * Convenience overload when content type is not already known.
+     *
+     * Prefer the overload that accepts `knownContentType` when possible,
+     * because upstream layers often already know the type from Mongo/request
+     * data and this helps keep the storage call path simpler.
      */
     public StoredObject download(String bucketName, String objectKey) {
         return download(bucketName, objectKey, null);
     }
 
     /**
-     * FIX — single HTTP call:
-     * نسخه قبلی هم getObject (برای stream) هم statObject (برای metadata)
-     * صدا می‌زد — دو connection همزمان به MinIO.
+     * Downloads an object from MinIO and returns:
+     * - bytes
+     * - content type
+     * - size
      *
-     * الان:
-     *   - فقط getObject صدا می‌شه (یه HTTP call)
-     *   - size از data.length محاسبه می‌شه (همیشه دقیقه چون همه byte ها
-     *     خونده شدن)
-     *   - contentType از caller می‌گیریم؛ caller قبلاً این مقدار رو یا
-     *     از MongoDB (file.getContentType) یا از request body داره
-     *
-     * @param knownContentType  مقدار file.getContentType() یا
-     *                          request.contentType() رو پاس بده؛
-     *                          null برای fallback به application/octet-stream
+     * Why `knownContentType` exists:
+     * - earlier versions needed an extra metadata lookup
+     * - now callers can pass content type they already know
+     * - this avoids an unnecessary extra MinIO round trip
      */
     public StoredObject download(String bucketName, String objectKey, String knownContentType) {
         try (var stream = minioClient.getObject(GetObjectArgs.builder()
@@ -96,8 +141,6 @@ public class MinioStorageService {
                     ? knownContentType
                     : "application/octet-stream";
 
-            // size = data.length چون همه bytes رو خوندیم —
-            // نیازی به stat.size() که مستلزم call جداست نیست
             return new StoredObject(data, contentType, (long) data.length);
 
         } catch (Exception e) {
@@ -105,10 +148,16 @@ public class MinioStorageService {
         }
     }
 
+    /*==============================*
+     *      Bucket management       *
+     *==============================*/
     /**
-     * FIX — bucket caching:
-     * اگه bucketName قبلاً در این session verify شده باشه زودتر return
-     * می‌کنه. اولین بار هنوز bucketExists صدا می‌شه ولی بعد از اون دیگه نه.
+     * Ensures the target bucket exists before upload.
+     *
+     * Behavior:
+     * - returns immediately if this bucket was already verified in memory
+     * - otherwise checks existence in MinIO
+     * - creates the bucket if it does not exist
      */
     private void ensureBucket(String bucketName) throws Exception {
         if (verifiedBuckets.contains(bucketName)) {
@@ -123,6 +172,17 @@ public class MinioStorageService {
         verifiedBuckets.add(bucketName);
     }
 
+    /*==============================*
+     *      Object-key strategy     *
+     *==============================*/
+    /**
+     * Builds a predictable storage path for uploaded files.
+     *
+     * Format idea:
+     * - date-based folders for easier browsing/housekeeping
+     * - UUID to avoid collisions
+     * - sanitized original filename for readability
+     */
     private String buildObjectKey(String originalFileName) {
         String safeName = originalFileName == null || originalFileName.isBlank()
                 ? "uploaded-file"

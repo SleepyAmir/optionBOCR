@@ -8,28 +8,48 @@ import org.springframework.beans.factory.annotation.Value;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 
+/*==============================*
+ *         MongoConfig          *
+ *==============================*/
 /**
- * Explicit MongoClient so the connection string is ALWAYS honored.
+ * Explicit MongoDB client configuration.
  *
- * Background: on Spring Boot 4.x the plain `spring.data.mongodb.host/port`
- * (and even `uri`) auto-config was silently falling back to the driver default
- * (localhost:27017) inside Docker, which caused "Connection refused" because
- * inside the container localhost is the app itself, not the mongo container.
+ * Why this class exists:
+ * - guarantees that the configured connection string is actually used
+ * - avoids ambiguity in containerized environments
+ * - makes Mongo client creation explicit and readable for new contributors
  *
- * Defining the MongoClient bean here removes any ambiguity: we read the
- * connection string from configuration and build the client directly.
- *
- * The value resolves in this order:
- *   1. SPRING_DATA_MONGODB_URI env var (set by docker-compose to
- *      mongodb://mongodb:27017/ocr_db)
- *   2. the default below, for running the jar directly on your machine.
+ * Historical reason:
+ * In Docker/container scenarios, relying on implicit defaults can easily cause
+ * the app to accidentally try connecting to localhost:27017 inside the app
+ * container, which is usually wrong. This config removes that uncertainty.
  */
 @Configuration
 public class MongoConfig {
 
+    /*==============================*
+     *   Externalized properties    *
+     *==============================*/
+    /**
+     * MongoDB connection string.
+     *
+     * Resolution order is controlled by Spring property resolution, typically:
+     * 1. environment variable
+     * 2. application.yaml
+     * 3. default value below
+     */
     @Value("${spring.data.mongodb.uri:mongodb://localhost:27017/ocr_db}")
     private String mongoUri;
 
+    /*==============================*
+     *      Infrastructure bean     *
+     *==============================*/
+    /**
+     * Creates the MongoDB client bean used by Spring Data MongoDB.
+     *
+     * Keeping this explicit helps first-time readers understand exactly how the
+     * application reaches MongoDB, especially in Dockerized development.
+     */
     @Bean
     public MongoClient mongoClient() {
         ConnectionString connectionString = new ConnectionString(mongoUri);
